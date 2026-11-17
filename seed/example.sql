@@ -1,5 +1,5 @@
 -- Example form. Edit the destination, then apply with:
---   npx wrangler d1 execute form-mail --remote --file=seed/example.sql
+--   npx wrangler d1 execute need-forms --remote --file=seed/example.sql
 -- Re-running updates the same id.
 
 INSERT INTO forms (id, destination_email, settings_json, created_at)

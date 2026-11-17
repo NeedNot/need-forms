@@ -1,8 +1,8 @@
 {
-  "name": "form-mail",
+  "name": "need-forms",
   "version": "1.0.0",
   "private": true,
-  "description": "Self-hosted form endpoint: store submissions in D1 and email them with Cloudflare Email Service, retrying failures on a cron.",
+  "description": "Need Forms: store submissions in D1 and email them with Cloudflare Email Service, retrying failures on a cron.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --port 43921 --ip 127.0.0.1",
@@ -10,8 +10,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "types": "wrangler types",
-    "db:migrate:local": "wrangler d1 migrations apply form-mail --local",
-    "db:migrate:remote": "wrangler d1 migrations apply form-mail --remote"
+    "db:migrate:local": "wrangler d1 migrations apply need-forms --local",
+    "db:migrate:remote": "wrangler d1 migrations apply need-forms --remote"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.8.3",

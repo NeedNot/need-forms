@@ -15,7 +15,7 @@ export type RenderedEmail = {
   html: string;
 };
 
-const TEST_SENDER = Symbol.for("form-mail.test-email-sender");
+const TEST_SENDER = Symbol.for("need-forms.test-email-sender");
 
 export type TestEmailSender = (message: OutboundEmail) => Promise<{ messageId: string }>;
 

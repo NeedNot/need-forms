@@ -18,7 +18,7 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/") {
-        return textResponse("Form mail is running. POST submissions to /submit/<formId>.");
+        return textResponse("Need Forms is running. POST submissions to /submit/<formId>.");
       }
 
       const match = FORM_PATH.exec(url.pathname);

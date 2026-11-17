@@ -49,7 +49,7 @@ async function post(body: BodyInit, headers: HeadersInit, path = "/submit/contac
 }> {
   const ctx = createExecutionContext();
   const response = await worker.fetch(
-    new Request(`https://form-mail.test${path}`, { method: "POST", headers, body }),
+    new Request(`https://need-forms.test${path}`, { method: "POST", headers, body }),
     env,
     ctx,
   );
@@ -151,7 +151,7 @@ describe("POST /submit/:formId", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({
       to: "owner@example.com",
-      from: { email: "forms@example.com", name: "Form Mail" },
+      from: { email: "no-reply@forms.neednot.net", name: "Need Forms" },
       replyTo: "ada@example.com",
       subject: "Contact from Ada Lovelace",
     });
@@ -170,7 +170,7 @@ describe("POST /submit/:formId", () => {
     });
     const ctx = createExecutionContext();
     const response = await worker.fetch(
-      new Request("https://form-mail.test/submit/contact", {
+      new Request("https://need-forms.test/submit/contact", {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body,
@@ -198,7 +198,7 @@ describe("POST /submit/:formId", () => {
     form.set("message", "From a file-less form");
     const ctx = createExecutionContext();
     const response = await worker.fetch(
-      new Request("https://form-mail.test/submit/contact", { method: "POST", body: form }),
+      new Request("https://need-forms.test/submit/contact", { method: "POST", body: form }),
       env,
       ctx,
     );
@@ -295,7 +295,7 @@ describe("POST /submit/:formId", () => {
 
   it("answers CORS preflight for any origin", async () => {
     const response = await worker.fetch(
-      new Request("https://form-mail.test/submit/contact", {
+      new Request("https://need-forms.test/submit/contact", {
         method: "OPTIONS",
         headers: {
           origin: "https://blog.example",
@@ -423,7 +423,7 @@ describe("email binding", () => {
     installTestSender(null);
     const direct = await env.EMAIL.send({
       to: "owner@example.com",
-      from: { email: "forms@example.com", name: "Form Mail" },
+      from: { email: "no-reply@forms.neednot.net", name: "Need Forms" },
       replyTo: "ada@example.com",
       subject: "Binding check",
       text: "Binding check",

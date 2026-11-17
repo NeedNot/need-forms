@@ -1,4 +1,4 @@
-# Form mail
+# Need Forms
 
 A small self-hosted form endpoint. A page on any site can `POST` to this Cloudflare Worker. The Worker stores the submission in [D1](https://developers.cloudflare.com/d1/) first, then emails it with the [Email Service](https://developers.cloudflare.com/email-service/api/send-emails/workers-api/) `send_email` binding. If that send fails, the HTTP request still succeeds. A Cron Trigger later retries due rows with exponential backoff. Rows are kept forever for statistics: nothing in this Worker deletes them.
 
@@ -140,15 +140,15 @@ A claim older than 10 minutes (`CLAIM_LEASE_SECONDS`) is put back to `pending` a
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `EMAIL_FROM` | `forms@example.com` | From address. Must be on a domain onboarded to Email Sending |
-| `EMAIL_FROM_NAME` | `Form Mail` | From display name |
+| `EMAIL_FROM` | `no-reply@forms.neednot.net` | From address. The domain must be onboarded to Email Sending |
+| `EMAIL_FROM_NAME` | `Need Forms` | From display name |
 | `MAX_ATTEMPTS` | `5` | Sends attempted before `failed` |
 | `RETRY_BASE_SECONDS` | `60` | First backoff |
 | `RETRY_MAX_SECONDS` | `3600` | Backoff cap |
 | `CLAIM_LEASE_SECONDS` | `600` | How long a `sending` claim is held |
 | `MAX_PAYLOAD_BYTES` | `100000` | Max request body. Enough for a long message, small enough to reject bulk junk |
 
-`forms@example.com` is a placeholder. Sends fail, and rows stay `pending`, until you replace it with an address on an onboarded domain.
+`EMAIL_FROM` is `no-reply@forms.neednot.net`. Sends stay `pending` until that domain is onboarded to Email Sending.
 
 Local `wrangler dev` simulates `send_email` and does not deliver. Logged mail is not sent. Add `"remote": true` on the `send_email` binding only when you want local code to send real messages.
 
@@ -159,36 +159,36 @@ You need a Cloudflare account, a zone on Cloudflare DNS, and Email Sending enabl
 ```bash
 npm install
 npx wrangler login
-npx wrangler d1 create form-mail
+npx wrangler d1 create need-forms
 ```
 
 Put the printed database id in `wrangler.jsonc` in place of `00000000-0000-0000-0000-000000000000`.
 
 ```bash
-npx wrangler d1 migrations apply form-mail --remote
+npx wrangler d1 migrations apply need-forms --remote
 ```
 
-Onboard the sending domain. Dashboard: **Compute** → **Email Service** → **Email Sending** → **Onboard Domain**. Or:
+Onboard `forms.neednot.net` for Email Sending. The zone `neednot.net` has to be on the same Cloudflare account so the custom domain route can attach. Dashboard: **Compute** → **Email Service** → **Email Sending** → **Onboard Domain**. Or:
 
 ```bash
-npx wrangler email sending enable yourdomain.com
+npx wrangler email sending enable forms.neednot.net
 ```
 
-Set `EMAIL_FROM` to an address on that domain and `EMAIL_FROM_NAME` to the name recipients should see. Edit the destination in `seed/example.sql`, then load the example form (or use the insert in the next section):
+`EMAIL_FROM` and `EMAIL_FROM_NAME` are already set. Edit the destination in `seed/example.sql`, then load the example form (or use the insert in the next section):
 
 ```bash
-npx wrangler d1 execute form-mail --remote --file=seed/example.sql
+npx wrangler d1 execute need-forms --remote --file=seed/example.sql
 npx wrangler deploy
 ```
 
-The deploy output prints the workers.dev URL. Point forms at `https://<worker>.workers.dev/submit/<formId>`.
+Deploy attaches the Worker to `forms.neednot.net`. Point forms at `https://forms.neednot.net/submit/<formId>`.
 
 Nothing in this repository has been deployed, and the D1 id is not a real database.
 
 ## Add a form
 
 ```bash
-npx wrangler d1 execute form-mail --remote --command "INSERT INTO forms (id, destination_email, settings_json, created_at) VALUES ('contact', 'you@example.com', '{\"subject\":\"New contact form submission\"}', '2026-01-01T00:00:00.000Z');"
+npx wrangler d1 execute need-forms --remote --command "INSERT INTO forms (id, destination_email, settings_json, created_at) VALUES ('contact', 'you@example.com', '{\"subject\":\"New contact form submission\"}', '2026-01-01T00:00:00.000Z');"
 ```
 
 Change an existing form, including a retry that has not been sent yet (the destination is read at send time):
@@ -207,7 +207,7 @@ Running `seed/example.sql` again updates the `contact` row's destination and set
 Hide `_honeypot` visually and leave it empty. Bots that fill every input are stored as spam and are not emailed.
 
 ```html
-<form action="https://YOUR_WORKER.workers.dev/submit/contact" method="POST">
+<form action="https://forms.neednot.net/submit/contact" method="POST">
   <p style="position:absolute;left:-9999px" aria-hidden="true">
     <label>Leave this empty <input type="text" name="_honeypot" tabindex="-1" autocomplete="off"></label>
   </p>
@@ -222,7 +222,7 @@ Hide `_honeypot` visually and leave it empty. Bots that fill every input are sto
 JSON:
 
 ```bash
-curl -X POST "https://YOUR_WORKER.workers.dev/submit/contact" \
+curl -X POST "https://forms.neednot.net/submit/contact" \
   -H "content-type: application/json" \
   -d '{"name":"Ada Lovelace","email":"ada@example.com","message":"Hello"}'
 ```
@@ -231,8 +231,8 @@ curl -X POST "https://YOUR_WORKER.workers.dev/submit/contact" \
 
 ```bash
 npm install
-npx wrangler d1 migrations apply form-mail --local
-npx wrangler d1 execute form-mail --local --file=seed/example.sql
+npx wrangler d1 migrations apply need-forms --local
+npx wrangler d1 execute need-forms --local --file=seed/example.sql
 npm run dev
 ```
 
@@ -247,7 +247,7 @@ curl -X POST "http://127.0.0.1:43921/submit/contact" \
 Check the row:
 
 ```bash
-npx wrangler d1 execute form-mail --local \
+npx wrangler d1 execute need-forms --local \
   --command "SELECT id, status, attempt_count, last_error, sent_at FROM submissions ORDER BY created_at DESC LIMIT 5;"
 ```
 
