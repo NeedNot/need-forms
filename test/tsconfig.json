@@ -1,0 +1,14 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": [],
+    "noUnusedLocals": false,
+    "moduleResolution": "bundler"
+  },
+  "include": [
+    "./**/*.ts",
+    "../src/**/*.ts",
+    "../worker-configuration.d.ts",
+    "../node_modules/@cloudflare/vitest-plugin/types/cloudflare-test.d.ts"
+  ]
+}

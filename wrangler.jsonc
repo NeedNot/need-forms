@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "form-mail",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  // EMAIL_FROM must be an address on a domain onboarded to Cloudflare Email Sending.
+  // example.com is a placeholder so this config does not send as a real domain.
+  "vars": {
+    "EMAIL_FROM": "forms@example.com",
+    "EMAIL_FROM_NAME": "Form Mail",
+    "MAX_ATTEMPTS": "5",
+    "RETRY_BASE_SECONDS": "60",
+    "RETRY_MAX_SECONDS": "3600",
+    "CLAIM_LEASE_SECONDS": "600",
+    "MAX_PAYLOAD_BYTES": "100000"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "form-mail",
+      // Placeholder. Replace with the id printed by `wrangler d1 create form-mail`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Local `wrangler dev` simulates this binding and does not deliver mail.
+  // Add `"remote": true` only when you intentionally want local code to send real email.
+  "send_email": [{ "name": "EMAIL" }],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "form-mail",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted form endpoint: store submissions in D1 and email them with Cloudflare Email Service, retrying failures on a cron.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 43921 --ip 127.0.0.1",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
+    "types": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply form-mail --local",
+    "db:migrate:remote": "wrangler d1 migrations apply form-mail --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.8.3",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12",
+    "wrangler": "4.163.0"
+  }
+}
