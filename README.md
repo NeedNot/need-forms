@@ -2,7 +2,7 @@
 
 A small self-hosted form endpoint. A page on any site can `POST` to this Cloudflare Worker. The Worker stores the submission in [D1](https://developers.cloudflare.com/d1/) first, then emails it with the [Email Service](https://developers.cloudflare.com/email-service/api/send-emails/workers-api/) `send_email` binding. If that send fails, the HTTP request still succeeds. A Cron Trigger later retries due rows with exponential backoff. Rows are kept forever for statistics: nothing in this Worker deletes them.
 
-`database_id` in `wrangler.jsonc` is a placeholder. This repo does not create Cloudflare resources and does not deploy.
+`database_id` in `wrangler.jsonc` is the existing D1 database `need-forms`. This repo does not deploy or apply migrations.
 
 ## Endpoint
 
@@ -159,12 +159,6 @@ You need a Cloudflare account, a zone on Cloudflare DNS, and Email Sending enabl
 ```bash
 npm install
 npx wrangler login
-npx wrangler d1 create need-forms
-```
-
-Put the printed database id in `wrangler.jsonc` in place of `00000000-0000-0000-0000-000000000000`.
-
-```bash
 npx wrangler d1 migrations apply need-forms --remote
 ```
 
@@ -183,7 +177,7 @@ npx wrangler deploy
 
 Deploy attaches the Worker to `forms.neednot.net`. Point forms at `https://forms.neednot.net/submit/<formId>`.
 
-Nothing in this repository has been deployed, and the D1 id is not a real database.
+Nothing in this repository has been deployed, and the migrations have not been applied to D1.
 
 ## Add a form
 

@@ -30,8 +30,7 @@
     {
       "binding": "DB",
       "database_name": "need-forms",
-      // Placeholder. Replace with the id printed by `wrangler d1 create need-forms`.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "5d40dd61-d245-4a50-8cd9-cee9fce2b95c",
       "migrations_dir": "migrations"
     }
   ],
