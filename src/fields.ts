@@ -1,4 +1,5 @@
 export const DEFAULT_HONEYPOT_FIELD = "math-sum";
+export const DEFAULT_TIME_ZONE = "America/Los_Angeles";
 
 const FORM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const EMAIL_PATTERN = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
@@ -9,6 +10,8 @@ export type FormSettings = {
   subject?: string;
   /** Submission field that traps bots when it is non-empty. Defaults to `math-sum`. */
   honeypot_field?: string;
+  /** IANA time zone for the received date in the notification. Defaults to America/Los_Angeles. */
+  timezone?: string;
 };
 
 export type PartitionedFields = {
@@ -25,13 +28,16 @@ export function parseSettings(json: string): FormSettings {
   try {
     const value: unknown = JSON.parse(json);
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    const record = value as { subject?: unknown; honeypot_field?: unknown };
+    const record = value as { subject?: unknown; honeypot_field?: unknown; timezone?: unknown };
     const settings: FormSettings = {};
     if (typeof record.subject === "string" && record.subject.trim().length > 0) {
       settings.subject = record.subject.trim();
     }
     if (typeof record.honeypot_field === "string" && record.honeypot_field.trim().length > 0) {
       settings.honeypot_field = record.honeypot_field.trim();
+    }
+    if (typeof record.timezone === "string" && record.timezone.trim().length > 0) {
+      settings.timezone = record.timezone.trim();
     }
     return settings;
   } catch {
@@ -50,6 +56,17 @@ export function honeypotFieldName(settings: FormSettings): string {
     return custom;
   }
   return DEFAULT_HONEYPOT_FIELD;
+}
+
+export function timeZoneName(settings: FormSettings): string {
+  const zone = settings.timezone?.trim();
+  if (!zone) return DEFAULT_TIME_ZONE;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return zone;
+  } catch {
+    return DEFAULT_TIME_ZONE;
+  }
 }
 
 export function isLikelyEmail(value: string): boolean {

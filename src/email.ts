@@ -1,4 +1,11 @@
-import { renderSubject, sanitizeHeader, type FormSettings } from "./fields";
+import {
+  honeypotFieldName,
+  isLikelyEmail,
+  renderSubject,
+  sanitizeHeader,
+  timeZoneName,
+  type FormSettings,
+} from "./fields";
 
 export type OutboundEmail = {
   to: string;
@@ -42,6 +49,48 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+export function prettifyFieldName(name: string): string {
+  const words = name.split(/[_-]+/).filter((word) => word.length > 0);
+  if (words.length === 0) return name;
+  return words.map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(" ");
+}
+
+export function formatReceivedAt(createdAt: string, timeZone: string): string {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return createdAt;
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+    timeZone,
+  }).format(date);
+}
+
+function visibleFields(fields: Record<string, string>, settings: FormSettings): [string, string][] {
+  const honeypot = honeypotFieldName(settings);
+  return Object.entries(fields).filter(([key]) => {
+    if (key.startsWith("_")) return false;
+    if (key === honeypot || key === "redirect") return false;
+    return true;
+  });
+}
+
+function renderValueHtml(value: string): string {
+  const trimmed = value.trim();
+  if (isLikelyEmail(trimmed)) {
+    const address = escapeHtml(trimmed);
+    return `<a href="mailto:${address}" style="color:#1d4ed8;text-decoration:underline;">${address}</a>`;
+  }
+  return escapeHtml(value);
+}
+
+const FONT =
+  "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+
 export function renderSubmissionEmail(input: {
   formId: string;
   submissionId: string;
@@ -50,34 +99,51 @@ export function renderSubmissionEmail(input: {
   settings: FormSettings;
 }): RenderedEmail {
   const subject = renderSubject(input.settings, input.fields, input.formId);
-  const lines = [
-    `Form: ${input.formId}`,
-    `Submission: ${input.submissionId}`,
-    `Received: ${input.createdAt}`,
-    "",
-  ];
+  const received = formatReceivedAt(input.createdAt, timeZoneName(input.settings));
+  const heading = `New submission on ${input.formId}`;
+  const footer = `Sent by Need Forms · ID ${input.submissionId}`;
+  const fields = visibleFields(input.fields, input.settings);
+
+  const textLines = [heading, received, ""];
   const rows: string[] = [];
-  for (const [key, value] of Object.entries(input.fields)) {
-    lines.push(`${key}: ${value}`);
+  for (const [key, value] of fields) {
+    const label = prettifyFieldName(key);
+    textLines.push(`${label}: ${value}`);
     rows.push(
-      `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`,
+      `<tr>
+<td style="padding:10px 12px;border-bottom:1px solid #e7e5e4;font-weight:700;color:#78716c;width:34%;vertical-align:top;">${escapeHtml(label)}</td>
+<td style="padding:10px 12px;border-bottom:1px solid #e7e5e4;color:#1c1917;vertical-align:top;white-space:pre-wrap;">${renderValueHtml(value)}</td>
+</tr>`,
     );
   }
-  if (Object.keys(input.fields).length === 0) {
-    lines.push("(no fields)");
-  }
-  const text = lines.join("\n");
+  textLines.push("", footer);
+
   const html = `<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="utf-8"><title>${escapeHtml(subject)}</title></head>
-<body>
-<p>Form <strong>${escapeHtml(input.formId)}</strong><br>
-Submission ${escapeHtml(input.submissionId)}<br>
-Received ${escapeHtml(input.createdAt)}</p>
-<dl>${rows.join("")}</dl>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(subject)}</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f4f5;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;font-family:${FONT};color:#1c1917;">
+<tr><td style="padding:24px 24px 4px;font-size:18px;line-height:1.4;font-weight:600;">${escapeHtml(heading)}</td></tr>
+<tr><td style="padding:0 24px 16px;font-size:14px;line-height:1.4;color:#57534e;">${escapeHtml(received)}</td></tr>
+<tr><td style="padding:0 24px 8px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;font-family:${FONT};font-size:15px;line-height:1.45;">
+${rows.join("\n")}
+</table>
+</td></tr>
+<tr><td style="padding:16px 24px 24px;font-size:12px;line-height:1.4;color:#a8a29e;">${escapeHtml(footer)}</td></tr>
+</table>
+</td></tr>
+</table>
 </body>
 </html>`;
-  return { subject, text, html };
+
+  return { subject, text: textLines.join("\n"), html };
 }
 
 export function buildOutboundEmail(input: {

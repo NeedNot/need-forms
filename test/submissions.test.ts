@@ -9,7 +9,7 @@ import {
 import { beforeEach, describe, expect, it } from "vitest";
 import { backoffSeconds } from "../src/config";
 import { installTestPublisher } from "../src/deliver";
-import { installTestSender, type OutboundEmail } from "../src/email";
+import { installTestSender, renderSubmissionEmail, type OutboundEmail } from "../src/email";
 import worker from "../src/index";
 
 type SubmissionRow = {
@@ -126,6 +126,82 @@ async function insertPending(options: {
   return id;
 }
 
+describe("notification email", () => {
+  const createdAt = "2026-11-17T04:34:53.467Z";
+  const submissionId = "4f1603f9-2ce9-4cab-bdd3-17b67caf25cc";
+  const fields = {
+    name: "Ada Lovelace",
+    email: "ada@example.com",
+    phone_number: "555-0100",
+    how_can_we_help: "Hello\nthere <b>friends</b>",
+    "math-sum": "https://spam.example",
+    _redirect: "https://evil.example",
+    redirect: "https://example.com/thanks",
+  };
+
+  it("uses the default subject, Pacific time, and a readable layout", () => {
+    const rendered = renderSubmissionEmail({
+      formId: "manrike",
+      submissionId,
+      createdAt,
+      fields,
+      settings: {},
+    });
+    expect(rendered.subject).toBe("New form submission (manrike)");
+    expect(rendered.text).toBe(
+      [
+        "New submission on manrike",
+        "Monday, November 16, 2026 at 8:34 PM PST",
+        "",
+        "Name: Ada Lovelace",
+        "Email: ada@example.com",
+        "Phone Number: 555-0100",
+        "How Can We Help: Hello\nthere <b>friends</b>",
+        "",
+        `Sent by Need Forms · ID ${submissionId}`,
+      ].join("\n"),
+    );
+    expect(rendered.html).toContain("New submission on manrike");
+    expect(rendered.html).toContain("Monday, November 16, 2026 at 8:34 PM PST");
+    expect(rendered.html).toContain("max-width:600px");
+    expect(rendered.html).toContain("font-weight:700");
+    expect(rendered.html).toContain("white-space:pre-wrap");
+    expect(rendered.html).toContain("mailto:ada@example.com");
+    expect(rendered.html).toContain("Phone Number");
+    expect(rendered.html).toContain("Hello\nthere &lt;b&gt;friends&lt;/b&gt;");
+    expect(rendered.html).toContain(`Sent by Need Forms · ID ${submissionId}`);
+    expect(rendered.html).not.toContain("spam.example");
+    expect(rendered.html).not.toContain("evil.example");
+    expect(rendered.html).not.toContain("example.com/thanks");
+    expect(rendered.html).not.toContain(createdAt);
+    expect(rendered.html.indexOf(submissionId)).toBeGreaterThan(rendered.html.indexOf("New submission on manrike"));
+  });
+
+  it("keeps a custom subject and honors settings_json.timezone", () => {
+    const rendered = renderSubmissionEmail({
+      formId: "manrike",
+      submissionId,
+      createdAt,
+      fields,
+      settings: { subject: "Contact from {{name}}", timezone: "America/New_York" },
+    });
+    expect(rendered.subject).toBe("Contact from Ada Lovelace");
+    expect(rendered.text).toContain("Monday, November 16, 2026 at 11:34 PM EST");
+    expect(rendered.html).toContain("Monday, November 16, 2026 at 11:34 PM EST");
+  });
+
+  it("ignores an unknown time zone", () => {
+    const rendered = renderSubmissionEmail({
+      formId: "manrike",
+      submissionId,
+      createdAt,
+      fields: { name: "Ada" },
+      settings: { timezone: "Not/AZone" },
+    });
+    expect(rendered.text).toContain("Monday, November 16, 2026 at 8:34 PM PST");
+  });
+});
+
 describe("backoff", () => {
   it("doubles until the cap", () => {
     expect(backoffSeconds(1, 60, 3600)).toBe(60);
@@ -179,10 +255,17 @@ describe("POST /submit/:formId", () => {
       replyTo: "ada@example.com",
       subject: "Contact from Ada Lovelace",
     });
-    expect(sent[0]?.text).toContain("message: Hello");
+    expect(sent[0]?.text).toContain("New submission on contact");
+    expect(sent[0]?.text).toContain("Name: Ada Lovelace");
+    expect(sent[0]?.text).toContain("Message: Hello");
+    expect(sent[0]?.text).toContain(`Sent by Need Forms · ID ${saved.id}`);
     expect(sent[0]?.text).not.toContain("math-sum");
     expect(sent[0]?.text).not.toContain("example.com/thanks");
-    expect(sent[0]?.html).toContain("Hello");
+    expect(sent[0]?.text).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    expect(sent[0]?.html).toContain("New submission on contact");
+    expect(sent[0]?.html).toContain("mailto:ada@example.com");
+    expect(sent[0]?.html).toContain(`Sent by Need Forms · ID ${saved.id}`);
+    expect(sent[0]?.html?.indexOf(saved.id)).toBeGreaterThan(sent[0]?.html?.indexOf("New submission on contact") ?? 0);
   });
 
   it("accepts an HTML form post and redirects", async () => {

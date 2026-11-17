@@ -54,7 +54,7 @@ Every response includes `access-control-allow-origin: *`, so a form hosted on an
 
 Other fields are the message. The first field whose name normalizes to `email` or `emailaddress` (`email`, `e-mail`, `email_address`, `emailAddress`) and looks like an email address is stored in `submitter_email` and used as the message's `replyTo`. It is also included in the body with the other fields.
 
-The email has both a plain-text and an HTML body listing those fields, plus the form id, submission id, and `created_at`. The From address and display name come from `EMAIL_FROM` and `EMAIL_FROM_NAME`. The To address is the form's `destination_email`, read again at send time, so a correction to the form row applies to retries.
+The notification is a short header (`New submission on <form id>`), the received time in the form's time zone, and a two-column table of the fields. The subject stays `New form submission (<form id>)` unless `settings_json.subject` is set. The submission id is only in the footer. Underscore fields and the honeypot are left out. The From address and display name come from `EMAIL_FROM` and `EMAIL_FROM_NAME`. The To address is the form's `destination_email`, read again at send time, so a correction to the form row applies to retries.
 
 ### Subject
 
@@ -64,7 +64,7 @@ The email has both a plain-text and an HTML body listing those fields, plus the 
 {"subject":"Contact from {{name}}","honeypot_field":"company"}
 ```
 
-Omit `honeypot_field` to keep the default `math-sum`.
+Omit `honeypot_field` to keep the default `math-sum`. `timezone` is an IANA name used for the received date. It defaults to `America/Los_Angeles`. An unrecognized zone uses that default.
 
 Add further per-form options as new keys in `settings_json` and read them in `parseSettings` (`src/fields.ts`). Use a migration only when a setting needs to be filtered in SQL.
 
@@ -106,7 +106,7 @@ CREATE TABLE submissions (
 | `next_attempt_at` | Set when the queue accepts the message, then moved to the next retry time after a failure. Null on a pending row means the enqueue never succeeded |
 | `sent_at` | When the send was accepted |
 | `message_id` | Email Service id, so a sent row can be matched to Email Service logs |
-| `settings_json` | Per-form options. This Worker reads `subject` and `honeypot_field` |
+| `settings_json` | Per-form options. This Worker reads `subject`, `honeypot_field`, and `timezone` |
 
 D1 does not enforce the foreign key unless you turn foreign keys on. Do not `DELETE` from `submissions`. To count outcomes:
 
