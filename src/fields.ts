@@ -1,4 +1,4 @@
-export const HONEYPOT_FIELD = "_honeypot";
+export const DEFAULT_HONEYPOT_FIELD = "math-sum";
 
 const FORM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const EMAIL_PATTERN = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
@@ -7,6 +7,8 @@ const FIELD_NAME_PATTERN = /^[^\u0000-\u001F\u007F]{1,100}$/;
 export type FormSettings = {
   /** Subject template. Supports `{{field_name}}` and `{{form_id}}`. */
   subject?: string;
+  /** Submission field that traps bots when it is non-empty. Defaults to `math-sum`. */
+  honeypot_field?: string;
 };
 
 export type PartitionedFields = {
@@ -23,13 +25,31 @@ export function parseSettings(json: string): FormSettings {
   try {
     const value: unknown = JSON.parse(json);
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    const subject = (value as { subject?: unknown }).subject;
-    if (typeof subject !== "string") return {};
-    const trimmed = subject.trim();
-    return trimmed.length > 0 ? { subject: trimmed } : {};
+    const record = value as { subject?: unknown; honeypot_field?: unknown };
+    const settings: FormSettings = {};
+    if (typeof record.subject === "string" && record.subject.trim().length > 0) {
+      settings.subject = record.subject.trim();
+    }
+    if (typeof record.honeypot_field === "string" && record.honeypot_field.trim().length > 0) {
+      settings.honeypot_field = record.honeypot_field.trim();
+    }
+    return settings;
   } catch {
     return {};
   }
+}
+
+export function honeypotFieldName(settings: FormSettings): string {
+  const custom = settings.honeypot_field;
+  if (
+    custom &&
+    FIELD_NAME_PATTERN.test(custom) &&
+    custom !== "redirect" &&
+    custom !== "_redirect"
+  ) {
+    return custom;
+  }
+  return DEFAULT_HONEYPOT_FIELD;
 }
 
 export function isLikelyEmail(value: string): boolean {
@@ -69,12 +89,15 @@ export function safeRedirect(value: string | undefined): string | null {
   return url.toString();
 }
 
-export function partitionFields(input: Record<string, string>): PartitionedFields {
+export function partitionFields(
+  input: Record<string, string>,
+  honeypotField = DEFAULT_HONEYPOT_FIELD,
+): PartitionedFields {
   const redirect = safeRedirect(input.redirect?.trim() || input._redirect?.trim() || undefined);
-  const honeypot = input[HONEYPOT_FIELD] ?? "";
+  const honeypot = input[honeypotField] ?? "";
   const fields: Record<string, string> = {};
   for (const [key, value] of Object.entries(input)) {
-    if (key === HONEYPOT_FIELD || key === "redirect" || key === "_redirect") continue;
+    if (key === honeypotField || key === "redirect" || key === "_redirect") continue;
     if (!FIELD_NAME_PATTERN.test(key)) continue;
     fields[key] = value;
   }

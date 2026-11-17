@@ -1,10 +1,8 @@
 export type AppConfig = {
   emailFrom: string;
   emailFromName: string;
-  maxAttempts: number;
   retryBaseSeconds: number;
   retryMaxSeconds: number;
-  claimLeaseSeconds: number;
   maxPayloadBytes: number;
 };
 
@@ -18,10 +16,8 @@ export function readConfig(env: Env): AppConfig {
   return {
     emailFrom: env.EMAIL_FROM,
     emailFromName: env.EMAIL_FROM_NAME,
-    maxAttempts: positiveInt(env.MAX_ATTEMPTS, 5),
     retryBaseSeconds: positiveInt(env.RETRY_BASE_SECONDS, 60),
     retryMaxSeconds: positiveInt(env.RETRY_MAX_SECONDS, 3600),
-    claimLeaseSeconds: positiveInt(env.CLAIM_LEASE_SECONDS, 600),
     maxPayloadBytes: positiveInt(env.MAX_PAYLOAD_BYTES, 100_000),
   };
 }
