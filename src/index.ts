@@ -1,4 +1,4 @@
-import { processDueSubmissions } from "./deliver";
+import { handleQueueBatch, reenqueueStalePending } from "./deliver";
 import { corsHeaders, HttpError, jsonResponse, textResponse } from "./http";
 import { handleSubmit } from "./submit";
 
@@ -10,7 +10,7 @@ function logError(error: unknown, path: string): void {
 }
 
 export default {
-  async fetch(request, env, ctx): Promise<Response> {
+  async fetch(request, env, _ctx): Promise<Response> {
     const url = new URL(request.url);
     try {
       if (request.method === "OPTIONS") {
@@ -35,7 +35,7 @@ export default {
         return jsonResponse({ ok: false, error: "form_not_found" }, 404);
       }
 
-      return await handleSubmit(request, env, ctx, formId);
+      return await handleSubmit(request, env, formId);
     } catch (error) {
       if (error instanceof HttpError) {
         return jsonResponse({ ok: false, error: error.code }, error.status);
@@ -56,6 +56,10 @@ export default {
         scheduledTime: when.toISOString(),
       }),
     );
-    await processDueSubmissions(env, when);
+    await reenqueueStalePending(env, when);
+  },
+
+  async queue(batch, env, _ctx): Promise<void> {
+    await handleQueueBatch(batch, env);
   },
 } satisfies ExportedHandler<Env>;

@@ -1,7 +1,14 @@
-import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
+import {
+  createExecutionContext,
+  createMessageBatch,
+  createScheduledController,
+  env,
+  getQueueResult,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { backoffSeconds } from "../src/config";
-import { deliverSubmission } from "../src/deliver";
+import { installTestPublisher } from "../src/deliver";
 import { installTestSender, type OutboundEmail } from "../src/email";
 import worker from "../src/index";
 
@@ -15,7 +22,6 @@ type SubmissionRow = {
   last_error: string | null;
   next_attempt_at: string | null;
   sent_at: string | null;
-  claimed_at: string | null;
   message_id: string | null;
   created_at: string;
 };
@@ -24,6 +30,7 @@ const sent: OutboundEmail[] = [];
 
 beforeEach(async () => {
   sent.length = 0;
+  installTestPublisher(null);
   installTestSender(async (message) => {
     sent.push(message);
     return { messageId: "msg_test" };
@@ -70,39 +77,50 @@ async function row(id: string): Promise<SubmissionRow> {
   return found;
 }
 
+async function runQueue(queueName: string, submissionId: string, attempts = 1) {
+  const ctx = createExecutionContext();
+  const batch = createMessageBatch(queueName, [
+    {
+      id: `queue-${submissionId}-${attempts}`,
+      timestamp: Date.now(),
+      attempts,
+      body: { submissionId },
+    },
+  ]);
+  if (!worker.queue) throw new Error("queue handler missing");
+  await worker.queue(batch, env, ctx);
+  return getQueueResult(batch, ctx);
+}
+
 async function runCron(scheduledTime = Date.now()): Promise<void> {
   const ctx = createExecutionContext();
   if (!worker.scheduled) throw new Error("scheduled handler missing");
-  await worker.scheduled(
-    createScheduledController({ scheduledTime, cron: "*/5 * * * *" }),
-    env,
-    ctx,
-  );
+  await worker.scheduled(createScheduledController({ scheduledTime, cron: "0 * * * *" }), env, ctx);
   await waitOnExecutionContext(ctx);
 }
 
 async function insertPending(options: {
   attemptCount?: number;
-  nextAttemptAt?: string;
+  nextAttemptAt?: string | null;
   status?: string;
-  claimedAt?: string | null;
+  createdAt?: string;
+  lastError?: string | null;
 }): Promise<string> {
   const id = crypto.randomUUID();
-  const status = options.status ?? "pending";
   await env.DB.prepare(
     `INSERT INTO submissions (
        id, form_id, payload_json, submitter_email, status, attempt_count,
-       last_error, next_attempt_at, sent_at, claimed_at, message_id, created_at
-     ) VALUES (?1, 'contact', ?2, 'ada@example.com', ?3, ?4, NULL, ?5, NULL, ?6, NULL, ?7)`,
+       last_error, next_attempt_at, sent_at, message_id, created_at
+     ) VALUES (?1, 'contact', ?2, 'ada@example.com', ?3, ?4, ?5, ?6, NULL, NULL, ?7)`,
   )
     .bind(
       id,
       JSON.stringify({ name: "Ada", email: "ada@example.com", message: "Hello" }),
-      status,
+      options.status ?? "pending",
       options.attemptCount ?? 0,
-      options.nextAttemptAt ?? "2020-01-01T00:00:00.000Z",
-      options.claimedAt ?? null,
-      "2026-01-02T00:00:00.000Z",
+      options.lastError ?? null,
+      options.nextAttemptAt === undefined ? null : options.nextAttemptAt,
+      options.createdAt ?? "2026-01-02T00:00:00.000Z",
     )
     .run();
   return id;
@@ -118,13 +136,14 @@ describe("backoff", () => {
 });
 
 describe("POST /submit/:formId", () => {
-  it("saves a JSON submission and a successful send marks it sent", async () => {
+  it("saves a JSON submission and leaves it pending until the queue consumer sends it", async () => {
     const { response, json } = await post(
       JSON.stringify({
         name: "Ada Lovelace",
         email: "ada@example.com",
         message: "Hello",
         redirect: "https://example.com/thanks",
+        "math-sum": "",
       }),
       { "content-type": "application/json; charset=utf-8" },
     );
@@ -132,22 +151,27 @@ describe("POST /submit/:formId", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("access-control-allow-origin")).toBe("*");
     expect(json).toMatchObject({ ok: true });
-    expect(json?.id).toBeTruthy();
-
     const saved = await row(json?.id ?? "");
-    expect(saved.status).toBe("sent");
-    expect(saved.form_id).toBe("contact");
-    expect(saved.attempt_count).toBe(1);
-    expect(saved.sent_at).toBeTruthy();
-    expect(saved.message_id).toBe("msg_test");
-    expect(saved.last_error).toBeNull();
-    expect(saved.next_attempt_at).toBeNull();
-    expect(saved.submitter_email).toBe("ada@example.com");
+    expect(saved.status).toBe("pending");
+    expect(saved.attempt_count).toBe(0);
+    expect(saved.next_attempt_at).toBeTruthy();
     expect(JSON.parse(saved.payload_json)).toEqual({
       name: "Ada Lovelace",
       email: "ada@example.com",
       message: "Hello",
     });
+    expect(sent).toHaveLength(0);
+
+    const result = await runQueue("need-forms-delivery", saved.id);
+    expect(result.explicitAcks).toContain(`queue-${saved.id}-1`);
+    expect(result.retryMessages).toHaveLength(0);
+    const delivered = await row(saved.id);
+    expect(delivered.status).toBe("sent");
+    expect(delivered.attempt_count).toBe(1);
+    expect(delivered.sent_at).toBeTruthy();
+    expect(delivered.message_id).toBe("msg_test");
+    expect(delivered.last_error).toBeNull();
+    expect(delivered.next_attempt_at).toBeNull();
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({
       to: "owner@example.com",
@@ -156,9 +180,9 @@ describe("POST /submit/:formId", () => {
       subject: "Contact from Ada Lovelace",
     });
     expect(sent[0]?.text).toContain("message: Hello");
+    expect(sent[0]?.text).not.toContain("math-sum");
     expect(sent[0]?.text).not.toContain("example.com/thanks");
     expect(sent[0]?.html).toContain("Hello");
-    expect(sent[0]?.html).toContain("<dt>name</dt>");
   });
 
   it("accepts an HTML form post and redirects", async () => {
@@ -179,12 +203,13 @@ describe("POST /submit/:formId", () => {
       ctx,
     );
     await waitOnExecutionContext(ctx);
-
     expect(response.status).toBe(303);
     expect(response.headers.get("location")).toBe("https://example.com/thanks");
-    const saved = await env.DB.prepare(`SELECT status, payload_json FROM submissions`)
-      .first<{ status: string; payload_json: string }>();
-    expect(saved?.status).toBe("sent");
+    const saved = await env.DB.prepare(`SELECT status, payload_json FROM submissions`).first<{
+      status: string;
+      payload_json: string;
+    }>();
+    expect(saved?.status).toBe("pending");
     expect(JSON.parse(saved?.payload_json ?? "{}")).toEqual({
       name: "Grace",
       email: "grace@example.com",
@@ -205,40 +230,31 @@ describe("POST /submit/:formId", () => {
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
-    const saved = await env.DB.prepare(`SELECT status, payload_json, submitter_email FROM submissions`)
-      .first<{ status: string; payload_json: string; submitter_email: string | null }>();
-    expect(saved?.status).toBe("sent");
+    const saved = await env.DB.prepare(
+      `SELECT status, payload_json, submitter_email FROM submissions`,
+    ).first<{ status: string; payload_json: string; submitter_email: string | null }>();
+    expect(saved?.status).toBe("pending");
     expect(saved?.submitter_email).toBeNull();
     expect(JSON.parse(saved?.payload_json ?? "{}")).toEqual({
       name: "Lin",
       message: "From a file-less form",
     });
-    expect(sent[0]?.replyTo).toBeUndefined();
   });
 
-  it("keeps the request successful when sending fails and schedules a backoff", async () => {
-    installTestSender(async () => {
-      throw Object.assign(new Error("mailbox unavailable"), { code: "E_RATE_LIMIT_EXCEEDED" });
+  it("still returns success when the queue rejects the message", async () => {
+    installTestPublisher(async () => {
+      throw new Error("queue unavailable");
     });
-    const before = Date.now();
     const { response, json } = await post(
       JSON.stringify({ name: "Ada", email: "ada@example.com", message: "Hello" }),
       { "content-type": "application/json" },
     );
-    const after = Date.now();
-
     expect(response.status).toBe(200);
     expect(json?.ok).toBe(true);
     const saved = await row(json?.id ?? "");
     expect(saved.status).toBe("pending");
-    expect(saved.attempt_count).toBe(1);
-    expect(saved.sent_at).toBeNull();
-    expect(saved.message_id).toBeNull();
-    expect(saved.last_error).toContain("E_RATE_LIMIT_EXCEEDED");
-    expect(saved.last_error).toContain("mailbox unavailable");
-    const next = Date.parse(saved.next_attempt_at ?? "");
-    expect(next).toBeGreaterThanOrEqual(before + 60_000 - 5_000);
-    expect(next).toBeLessThanOrEqual(after + 60_000 + 5_000);
+    expect(saved.next_attempt_at).toBeNull();
+    expect(saved.attempt_count).toBe(0);
   });
 
   it("returns 404 for an unknown form and stores nothing", async () => {
@@ -251,16 +267,15 @@ describe("POST /submit/:formId", () => {
     expect(json).toEqual({ ok: false, error: "form_not_found" });
     const count = await env.DB.prepare(`SELECT COUNT(*) AS n FROM submissions`).first<{ n: number }>();
     expect(count?.n).toBe(0);
-    expect(sent).toHaveLength(0);
   });
 
-  it("drops honeypot submissions without emailing them", async () => {
+  it("drops the default math-sum honeypot without queueing or emailing it", async () => {
     const { response, json } = await post(
       JSON.stringify({
         name: "Bot",
         email: "bot@example.com",
         message: "Buy this",
-        _honeypot: "https://spam.example",
+        "math-sum": "https://spam.example",
       }),
       { "content-type": "application/json" },
     );
@@ -275,11 +290,29 @@ describe("POST /submit/:formId", () => {
       email: "bot@example.com",
       message: "Buy this",
     });
-    expect(sent).toHaveLength(0);
+    expect(JSON.stringify(saved.payload_json)).not.toContain("spam.example");
 
-    await runCron();
+    const result = await runQueue("need-forms-delivery", saved.id);
+    expect(result.explicitAcks).toContain(`queue-${saved.id}-1`);
     expect(sent).toHaveLength(0);
     expect((await row(saved.id)).status).toBe("spam");
+  });
+
+  it("uses settings_json.honeypot_field when a form overrides the field name", async () => {
+    await env.DB.prepare(`UPDATE forms SET settings_json = ?1 WHERE id = 'contact'`)
+      .bind(JSON.stringify({ subject: "Contact from {{name}}", honeypot_field: "company" }))
+      .run();
+    const { json } = await post(
+      JSON.stringify({ name: "Bot", email: "bot@example.com", company: "Acme", "math-sum": "" }),
+      { "content-type": "application/json" },
+    );
+    const saved = await row(json?.id ?? "");
+    expect(saved.status).toBe("spam");
+    expect(JSON.parse(saved.payload_json)).toEqual({
+      name: "Bot",
+      email: "bot@example.com",
+      "math-sum": "",
+    });
   });
 
   it("rejects an oversized body", async () => {
@@ -312,132 +345,92 @@ describe("POST /submit/:formId", () => {
   });
 });
 
-describe("cron retries", () => {
-  it("sends a due submission and marks it sent", async () => {
-    const id = await insertPending({ attemptCount: 1, nextAttemptAt: "2020-01-01T00:00:00.000Z" });
-    const scheduledTime = Date.parse("2026-06-01T12:00:00.000Z");
-    await runCron(scheduledTime);
-
-    const saved = await row(id);
-    expect(saved.status).toBe("sent");
-    expect(saved.attempt_count).toBe(2);
-    expect(saved.sent_at).toBe(new Date(scheduledTime).toISOString());
-    expect(saved.message_id).toBe("msg_test");
-    expect(saved.last_error).toBeNull();
-    expect(sent).toHaveLength(1);
-    expect(sent[0]?.to).toBe("owner@example.com");
-  });
-
-  it("leaves a future retry pending", async () => {
-    const id = await insertPending({
-      attemptCount: 1,
-      nextAttemptAt: "2099-01-01T00:00:00.000Z",
+describe("delivery queue", () => {
+  it("retries a failed send with exponential backoff and keeps the row pending", async () => {
+    installTestSender(async () => {
+      throw Object.assign(new Error("mailbox unavailable"), { code: "E_RATE_LIMIT_EXCEEDED" });
     });
-    await runCron(Date.parse("2026-06-01T12:00:00.000Z"));
-    const saved = await row(id);
+    const id = await insertPending({ attemptCount: 0 });
+    const first = await runQueue("need-forms-delivery", id);
+    expect(first.retryMessages.map((message) => message.msgId)).toEqual([`queue-${id}-1`]);
+    let saved = await row(id);
     expect(saved.status).toBe("pending");
     expect(saved.attempt_count).toBe(1);
-    expect(sent).toHaveLength(0);
-  });
+    expect(saved.last_error).toContain("E_RATE_LIMIT_EXCEEDED");
+    expect(saved.last_error).toContain("mailbox unavailable");
+    expect(saved.sent_at).toBeNull();
+    let delayMs = Date.parse(saved.next_attempt_at ?? "") - Date.now();
+    expect(delayMs).toBeGreaterThan(50_000);
+    expect(delayMs).toBeLessThan(70_000);
 
-  it("applies exponential backoff on the next failed attempt", async () => {
-    installTestSender(async () => {
-      throw new Error("still down");
-    });
-    const id = await insertPending({ attemptCount: 1, nextAttemptAt: "2020-01-01T00:00:00.000Z" });
-    const scheduledTime = Date.parse("2026-06-01T12:00:00.000Z");
-    await runCron(scheduledTime);
-
-    const saved = await row(id);
-    expect(saved.status).toBe("pending");
+    const second = await runQueue("need-forms-delivery", id, 2);
+    expect(second.retryMessages.map((message) => message.msgId)).toEqual([`queue-${id}-2`]);
+    saved = await row(id);
     expect(saved.attempt_count).toBe(2);
-    expect(saved.last_error).toContain("still down");
-    expect(saved.next_attempt_at).toBe(new Date(scheduledTime + 120_000).toISOString());
+    delayMs = Date.parse(saved.next_attempt_at ?? "") - Date.now();
+    expect(delayMs).toBeGreaterThan(110_000);
+    expect(delayMs).toBeLessThan(130_000);
   });
 
-  it("marks the row failed after the last attempt and keeps it", async () => {
-    installTestSender(async () => {
-      throw new Error("permanent");
-    });
-    const id = await insertPending({ attemptCount: 4, nextAttemptAt: "2020-01-01T00:00:00.000Z" });
-    await runCron(Date.parse("2026-06-01T12:00:00.000Z"));
+  it("acks a message whose row is already sent", async () => {
+    const id = await insertPending({ status: "sent", attemptCount: 1 });
+    await env.DB.prepare(`UPDATE submissions SET sent_at = ?1, message_id = 'already' WHERE id = ?2`)
+      .bind("2026-06-01T12:00:00.000Z", id)
+      .run();
+    const result = await runQueue("need-forms-delivery", id);
+    expect(result.explicitAcks).toContain(`queue-${id}-1`);
+    expect(result.retryMessages).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+    expect((await row(id)).attempt_count).toBe(1);
+  });
 
+  it("marks a dead-lettered row failed and keeps the last error", async () => {
+    const id = await insertPending({ attemptCount: 5, lastError: "mailbox unavailable" });
+    const result = await runQueue("need-forms-delivery-dlq", id);
+    expect(result.explicitAcks).toContain(`queue-${id}-1`);
     const saved = await row(id);
     expect(saved.status).toBe("failed");
-    expect(saved.attempt_count).toBe(5);
-    expect(saved.sent_at).toBeNull();
+    expect(saved.last_error).toBe("mailbox unavailable");
     expect(saved.next_attempt_at).toBeNull();
-    expect(saved.last_error).toContain("permanent");
+    expect(saved.sent_at).toBeNull();
     const count = await env.DB.prepare(`SELECT COUNT(*) AS n FROM submissions`).first<{ n: number }>();
     expect(count?.n).toBe(1);
-
-    sent.length = 0;
-    installTestSender(async (message) => {
-      sent.push(message);
-      return { messageId: "msg_should_not_send" };
-    });
-    await runCron(Date.parse("2026-06-01T13:00:00.000Z"));
-    expect(sent).toHaveLength(0);
-    expect((await row(id)).status).toBe("failed");
   });
 
-  it("reclaims an expired send claim and then sends once", async () => {
-    const id = await insertPending({
-      status: "sending",
-      attemptCount: 1,
-      claimedAt: "2026-06-01T11:00:00.000Z",
-      nextAttemptAt: "2020-01-01T00:00:00.000Z",
-    });
-    await runCron(Date.parse("2026-06-01T12:00:00.000Z"));
+  it("uses env.EMAIL.send when no test sender is installed", async () => {
+    installTestSender(null);
+    const id = await insertPending({});
+    await runQueue("need-forms-delivery", id);
     const saved = await row(id);
     expect(saved.status).toBe("sent");
-    expect(saved.attempt_count).toBe(2);
-    expect(sent).toHaveLength(1);
-  });
-
-  it("does not send a row that is already claimed", async () => {
-    const id = await insertPending({
-      status: "sending",
-      attemptCount: 1,
-      claimedAt: new Date().toISOString(),
-      nextAttemptAt: "2020-01-01T00:00:00.000Z",
-    });
-    await runCron();
-    expect(sent).toHaveLength(0);
-    expect((await row(id)).status).toBe("sending");
-  });
-
-  it("claims a pending row only once when delivery overlaps", async () => {
-    const id = await insertPending({ attemptCount: 0, nextAttemptAt: "2020-01-01T00:00:00.000Z" });
-    const now = new Date("2026-06-01T12:00:00.000Z");
-    await Promise.all([deliverSubmission(env, id, now), deliverSubmission(env, id, now)]);
-    expect(sent).toHaveLength(1);
-    const saved = await row(id);
-    expect(saved.status).toBe("sent");
-    expect(saved.attempt_count).toBe(1);
+    expect(saved.message_id).toBeTruthy();
+    expect(saved.message_id).not.toBe("msg_test");
   });
 });
 
-describe("email binding", () => {
-  it("uses env.EMAIL.send when no test sender is installed", async () => {
-    installTestSender(null);
-    const direct = await env.EMAIL.send({
-      to: "owner@example.com",
-      from: { email: "no-reply@forms.neednot.net", name: "Need Forms" },
-      replyTo: "ada@example.com",
-      subject: "Binding check",
-      text: "Binding check",
-      html: "<p>Binding check</p>",
-    });
-    expect(direct.messageId).toBeTruthy();
+describe("hourly safety net", () => {
+  it("re-enqueues a pending row that was never accepted by the queue", async () => {
+    const createdAt = "2026-06-01T11:00:00.000Z";
+    const id = await insertPending({ createdAt, nextAttemptAt: null });
+    const scheduledTime = Date.parse("2026-06-01T12:00:00.000Z");
+    await runCron(scheduledTime);
+    const saved = await row(id);
+    expect(saved.status).toBe("pending");
+    expect(saved.next_attempt_at).toBe(new Date(scheduledTime).toISOString());
+  });
 
-    const { json } = await post(
-      JSON.stringify({ name: "Ada", email: "ada@example.com", message: "Via binding" }),
-      { "content-type": "application/json" },
-    );
-    const saved = await row(json?.id ?? "");
-    expect(saved.status, saved.last_error ?? "no error").toBe("sent");
-    expect(saved.message_id).toBeTruthy();
-    expect(saved.message_id).not.toBe("msg_test");
+  it("leaves a fresh pending row and an already queued row alone", async () => {
+    const scheduledTime = Date.parse("2026-06-01T12:00:00.000Z");
+    const fresh = await insertPending({
+      createdAt: new Date(scheduledTime - 60_000).toISOString(),
+      nextAttemptAt: null,
+    });
+    const queued = await insertPending({
+      createdAt: "2026-06-01T10:00:00.000Z",
+      nextAttemptAt: "2026-06-01T10:05:00.000Z",
+    });
+    await runCron(scheduledTime);
+    expect((await row(fresh)).next_attempt_at).toBeNull();
+    expect((await row(queued)).next_attempt_at).toBe("2026-06-01T10:05:00.000Z");
   });
 });

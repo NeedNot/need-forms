@@ -20,10 +20,8 @@
   "vars": {
     "EMAIL_FROM": "no-reply@forms.neednot.net",
     "EMAIL_FROM_NAME": "Need Forms",
-    "MAX_ATTEMPTS": "5",
     "RETRY_BASE_SECONDS": "60",
     "RETRY_MAX_SECONDS": "3600",
-    "CLAIM_LEASE_SECONDS": "600",
     "MAX_PAYLOAD_BYTES": "100000"
   },
   "d1_databases": [
@@ -37,8 +35,28 @@
   // Local `wrangler dev` simulates this binding and does not deliver mail.
   // Add `"remote": true` only when you intentionally want local code to send real email.
   "send_email": [{ "name": "EMAIL" }],
+  "queues": {
+    "producers": [
+      {
+        "binding": "DELIVERY_QUEUE",
+        "queue": "need-forms-delivery"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "need-forms-delivery",
+        "max_batch_size": 10,
+        "max_retries": 5,
+        "dead_letter_queue": "need-forms-delivery-dlq"
+      },
+      {
+        "queue": "need-forms-delivery-dlq",
+        "max_batch_size": 10
+      }
+    ]
+  },
   "routes": [{ "pattern": "forms.neednot.net", "custom_domain": true }],
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["0 * * * *"]
   }
 }

@@ -2,21 +2,29 @@ import { backoffSeconds, readConfig } from "./config";
 import { buildOutboundEmail, renderSubmissionEmail, sendFormEmail } from "./email";
 import { isLikelyEmail, parseSettings } from "./fields";
 
-const BATCH_LIMIT = 25;
+export const DELIVERY_QUEUE_NAME = "need-forms-delivery";
+export const DELIVERY_DLQ_NAME = "need-forms-delivery-dlq";
 
-export type DeliveryOutcome =
-  | { outcome: "skipped" }
-  | { outcome: "sent" }
-  | { outcome: "pending" }
-  | { outcome: "failed" };
+/** Pending rows with no queue acceptance older than this are enqueued again. */
+const STALE_PENDING_MS = 15 * 60 * 1000;
+const CRON_BATCH_LIMIT = 25;
 
-type ClaimedSubmission = {
+const TEST_PUBLISHER = Symbol.for("need-forms.test-publisher");
+
+export type DeliveryMessage = {
+  submissionId: string;
+};
+
+type TestPublisher = (submissionId: string) => Promise<void>;
+
+type SubmissionRow = {
   id: string;
   form_id: string;
   payload_json: string;
   submitter_email: string | null;
+  status: string;
   attempt_count: number;
-  claimed_at: string;
+  last_error: string | null;
   created_at: string;
 };
 
@@ -25,6 +33,20 @@ type FormRow = {
   destination_email: string;
   settings_json: string;
 };
+
+/**
+ * Tests can force the producer to fail. Production leaves this unset and uses
+ * env.DELIVERY_QUEUE.
+ */
+export function installTestPublisher(publisher: TestPublisher | null): void {
+  const target = globalThis as Record<symbol, TestPublisher | undefined>;
+  if (publisher) target[TEST_PUBLISHER] = publisher;
+  else delete target[TEST_PUBLISHER];
+}
+
+function testPublisher(): TestPublisher | undefined {
+  return (globalThis as Record<symbol, TestPublisher | undefined>)[TEST_PUBLISHER];
+}
 
 function errorText(error: unknown): string {
   let code: string | null = null;
@@ -45,62 +67,38 @@ function logError(message: string, fields: Record<string, unknown>): void {
   console.error(JSON.stringify({ message, ...fields }));
 }
 
-async function claim(env: Env, id: string, nowIso: string): Promise<ClaimedSubmission | null> {
-  const result = await env.DB.prepare(
-    `UPDATE submissions
-     SET status = 'sending',
-         attempt_count = attempt_count + 1,
-         claimed_at = ?1
-     WHERE id = ?2
-       AND status = 'pending'
-       AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)`,
-  )
-    .bind(nowIso, id)
-    .run();
-
-  if ((result.meta.changes ?? 0) !== 1) return null;
-
-  return env.DB.prepare(
-    `SELECT id, form_id, payload_json, submitter_email, attempt_count, claimed_at, created_at
-     FROM submissions
-     WHERE id = ?1 AND status = 'sending' AND claimed_at = ?2`,
-  )
-    .bind(id, nowIso)
-    .first<ClaimedSubmission>();
+function submissionIdOf(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const id = (body as { submissionId?: unknown }).submissionId;
+  return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-async function finish(
-  env: Env,
-  id: string,
-  claimedAt: string,
-  update: {
-    status: "sent" | "pending" | "failed";
-    sentAt: string | null;
-    messageId: string | null;
-    lastError: string | null;
-    nextAttemptAt: string | null;
-  },
-): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE submissions
-     SET status = ?1,
-         sent_at = ?2,
-         message_id = COALESCE(?3, message_id),
-         last_error = ?4,
-         next_attempt_at = ?5,
-         claimed_at = NULL
-     WHERE id = ?6 AND status = 'sending' AND claimed_at = ?7`,
-  )
-    .bind(
-      update.status,
-      update.sentAt,
-      update.messageId,
-      update.lastError,
-      update.nextAttemptAt,
-      id,
-      claimedAt,
+export async function publishDelivery(env: Env, submissionId: string, now = new Date()): Promise<boolean> {
+  try {
+    const publisher = testPublisher();
+    if (publisher) await publisher(submissionId);
+    else await env.DELIVERY_QUEUE.send({ submissionId });
+    await env.DB.prepare(
+      `UPDATE submissions
+       SET next_attempt_at = ?1
+       WHERE id = ?2 AND status = 'pending' AND next_attempt_at IS NULL`,
     )
-    .run();
+      .bind(now.toISOString(), submissionId)
+      .run();
+    return true;
+  } catch (error) {
+    logError("enqueue failed", { submissionId, error: errorText(error) });
+    return false;
+  }
+}
+
+async function loadSubmission(env: Env, id: string): Promise<SubmissionRow | null> {
+  return env.DB.prepare(
+    `SELECT id, form_id, payload_json, submitter_email, status, attempt_count, last_error, created_at
+     FROM submissions WHERE id = ?1`,
+  )
+    .bind(id)
+    .first<SubmissionRow>();
 }
 
 function parsePayload(payloadJson: string): Record<string, string> {
@@ -115,146 +113,127 @@ function parsePayload(payloadJson: string): Record<string, string> {
   return fields;
 }
 
-async function loadForm(env: Env, formId: string): Promise<FormRow | null> {
-  return env.DB.prepare(
+async function sendRow(env: Env, row: SubmissionRow): Promise<string> {
+  const config = readConfig(env);
+  const form = await env.DB.prepare(
     `SELECT id, destination_email, settings_json FROM forms WHERE id = ?1`,
   )
-    .bind(formId)
+    .bind(row.form_id)
     .first<FormRow>();
-}
-
-/**
- * Claim one pending row and try to email it.
- * A lost claim (another worker took it, or the lease moved on) is a skip, not a second send.
- */
-export async function deliverSubmission(
-  env: Env,
-  id: string,
-  now = new Date(),
-): Promise<DeliveryOutcome> {
-  const nowIso = now.toISOString();
-  const config = readConfig(env);
-  let claimed: ClaimedSubmission | null = null;
-  try {
-    claimed = await claim(env, id, nowIso);
-    if (!claimed) return { outcome: "skipped" };
-
-    const form = await loadForm(env, claimed.form_id);
-    if (!form) {
-      await finish(env, id, claimed.claimed_at, {
-        status: "failed",
-        sentAt: null,
-        messageId: null,
-        lastError: "form not found",
-        nextAttemptAt: null,
-      });
-      return { outcome: "failed" };
-    }
-    if (!isLikelyEmail(form.destination_email) || !isLikelyEmail(config.emailFrom)) {
-      throw new Error("destination or EMAIL_FROM is not a valid email address");
-    }
-
-    const fields = parsePayload(claimed.payload_json);
-    const settings = parseSettings(form.settings_json);
-    const rendered = renderSubmissionEmail({
-      formId: form.id,
-      submissionId: claimed.id,
-      createdAt: claimed.created_at,
-      fields,
-      settings,
-    });
-    const message = buildOutboundEmail({
+  if (!form) throw new Error("form not found");
+  if (!isLikelyEmail(form.destination_email) || !isLikelyEmail(config.emailFrom)) {
+    throw new Error("destination or EMAIL_FROM is not a valid email address");
+  }
+  const fields = parsePayload(row.payload_json);
+  const rendered = renderSubmissionEmail({
+    formId: form.id,
+    submissionId: row.id,
+    createdAt: row.created_at,
+    fields,
+    settings: parseSettings(form.settings_json),
+  });
+  return sendFormEmail(
+    env,
+    buildOutboundEmail({
       to: form.destination_email.trim(),
       fromEmail: config.emailFrom.trim(),
       fromName: config.emailFromName,
-      replyTo: claimed.submitter_email && isLikelyEmail(claimed.submitter_email)
-        ? claimed.submitter_email
-        : null,
+      replyTo: row.submitter_email && isLikelyEmail(row.submitter_email) ? row.submitter_email : null,
       rendered,
-    });
-    const messageId = await sendFormEmail(env, message);
-    await finish(env, id, claimed.claimed_at, {
-      status: "sent",
-      sentAt: nowIso,
-      messageId,
-      lastError: null,
-      nextAttemptAt: null,
-    });
-    log("submission emailed", { id, formId: form.id, attempt: claimed.attempt_count, messageId });
-    return { outcome: "sent" };
+    }),
+  );
+}
+
+async function consumeDelivery(env: Env, message: Message<unknown>, now: Date): Promise<void> {
+  const id = submissionIdOf(message.body);
+  if (!id) {
+    logError("discarding delivery message without submissionId", { messageId: message.id });
+    message.ack();
+    return;
+  }
+
+  const row = await loadSubmission(env, id);
+  if (!row || row.status === "sent" || row.status === "spam" || row.status === "failed") {
+    message.ack();
+    return;
+  }
+
+  try {
+    const providerId = await sendRow(env, row);
+    await env.DB.prepare(
+      `UPDATE submissions
+       SET status = 'sent',
+           sent_at = ?1,
+           message_id = ?2,
+           attempt_count = attempt_count + 1,
+           last_error = NULL,
+           next_attempt_at = NULL
+       WHERE id = ?3 AND status = 'pending'`,
+    )
+      .bind(now.toISOString(), providerId, id)
+      .run();
+    log("submission emailed", { id, attempt: row.attempt_count + 1, messageId: providerId });
+    message.ack();
   } catch (error) {
     const reason = errorText(error);
-    if (!claimed) {
-      logError("delivery failed before claim", { id, error: reason });
-      return { outcome: "skipped" };
-    }
-    const exhausted = claimed.attempt_count >= config.maxAttempts;
-    const nextAttemptAt = exhausted
-      ? null
-      : new Date(
-          now.getTime() +
-            backoffSeconds(claimed.attempt_count, config.retryBaseSeconds, config.retryMaxSeconds) *
-              1000,
-        ).toISOString();
-    const status = exhausted ? "failed" : "pending";
-    await finish(env, id, claimed.claimed_at, {
-      status,
-      sentAt: null,
-      messageId: null,
-      lastError: reason,
-      nextAttemptAt,
-    });
-    logError("email send failed", {
-      id,
-      formId: claimed.form_id,
-      attempt: claimed.attempt_count,
-      status,
-      nextAttemptAt,
-      error: reason,
-    });
-    return { outcome: status };
+    const attempt = row.attempt_count + 1;
+    const config = readConfig(env);
+    const delaySeconds = backoffSeconds(attempt, config.retryBaseSeconds, config.retryMaxSeconds);
+    const nextAttemptAt = new Date(now.getTime() + delaySeconds * 1000).toISOString();
+    await env.DB.prepare(
+      `UPDATE submissions
+       SET attempt_count = attempt_count + 1,
+           last_error = ?1,
+           next_attempt_at = ?2
+       WHERE id = ?3 AND status = 'pending'`,
+    )
+      .bind(reason, nextAttemptAt, id)
+      .run();
+    logError("email send failed", { id, attempt, delaySeconds, error: reason });
+    message.retry({ delaySeconds });
   }
 }
 
-async function releaseExpiredClaims(env: Env, now: Date): Promise<number> {
-  const config = readConfig(env);
-  const cutoff = new Date(now.getTime() - config.claimLeaseSeconds * 1000).toISOString();
-  const result = await env.DB.prepare(
-    `UPDATE submissions
-     SET status = 'pending',
-         next_attempt_at = ?1,
-         claimed_at = NULL,
-         last_error = COALESCE(last_error, 'send claim expired before completion')
-     WHERE status = 'sending'
-       AND claimed_at IS NOT NULL
-       AND claimed_at <= ?2`,
-  )
-    .bind(now.toISOString(), cutoff)
-    .run();
-  return result.meta.changes ?? 0;
+async function consumeDeadLetter(env: Env, message: Message<unknown>): Promise<void> {
+  const id = submissionIdOf(message.body);
+  if (id) {
+    await env.DB.prepare(
+      `UPDATE submissions
+       SET status = 'failed',
+           next_attempt_at = NULL,
+           last_error = COALESCE(last_error, 'delivery retries exhausted')
+       WHERE id = ?1 AND status = 'pending'`,
+    )
+      .bind(id)
+      .run();
+    logError("delivery moved to dead letter", { id });
+  }
+  message.ack();
 }
 
-export async function processDueSubmissions(env: Env, now = new Date()): Promise<void> {
-  const released = await releaseExpiredClaims(env, now);
-  const nowIso = now.toISOString();
+export async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, now = new Date()): Promise<void> {
+  for (const message of batch.messages) {
+    if (batch.queue === DELIVERY_DLQ_NAME) await consumeDeadLetter(env, message);
+    else await consumeDelivery(env, message, now);
+  }
+}
+
+export async function reenqueueStalePending(env: Env, now = new Date()): Promise<void> {
+  const cutoff = new Date(now.getTime() - STALE_PENDING_MS).toISOString();
   const due = await env.DB.prepare(
     `SELECT id FROM submissions
      WHERE status = 'pending'
-       AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
+       AND next_attempt_at IS NULL
+       AND created_at <= ?1
      ORDER BY created_at ASC
      LIMIT ?2`,
   )
-    .bind(nowIso, BATCH_LIMIT)
+    .bind(cutoff, CRON_BATCH_LIMIT)
     .all<{ id: string }>();
 
-  const counts = { sent: 0, pending: 0, failed: 0, skipped: 0 };
+  let enqueued = 0;
   for (const row of due.results) {
-    const result = await deliverSubmission(env, row.id, now);
-    counts[result.outcome] += 1;
+    if (await publishDelivery(env, row.id, now)) enqueued += 1;
   }
-  log("delivery pass complete", {
-    released,
-    due: due.results.length,
-    ...counts,
-  });
+  log("stale pending pass complete", { due: due.results.length, enqueued });
 }

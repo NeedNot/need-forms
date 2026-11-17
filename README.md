@@ -31,7 +31,7 @@ JSON callers always get JSON, even if the body includes `redirect`. Errors are a
 | 415 | `unsupported_media_type` | Any other content type |
 | 500 | `internal_error` | Unexpected failure while saving |
 
-The success response means the row was saved, not that the email has already been accepted. The send runs after the response (`ctx.waitUntil`). A send failure is written onto the row and retried by cron.
+The success response means the row was saved. Delivery is queued after the insert. If the queue rejects the message, the response is still success and the row stays `pending` for the hourly safety net.
 
 `OPTIONS` on any path returns **204** with:
 
@@ -49,7 +49,7 @@ Every response includes `access-control-allow-origin: *`, so a form hosted on an
 
 | Field | Behavior |
 | --- | --- |
-| `_honeypot` | If non-empty, the row is stored as `spam` and is not emailed. The response looks like success. |
+| `math-sum` | Default honeypot. If this field is non-empty, the row is stored as `spam` and is not emailed or queued. The response looks like success. A form can override the field name with `settings_json.honeypot_field`. The honeypot field is never included in the email. |
 | `redirect`, `_redirect` | HTML form posts only. After a successful save, **303** to that URL when it is `http:` or `https:` and at most 2000 characters. Anything else is ignored and the Worker returns the thank-you page. |
 
 Other fields are the message. The first field whose name normalizes to `email` or `emailaddress` (`email`, `e-mail`, `email_address`, `emailAddress`) and looks like an email address is stored in `submitter_email` and used as the message's `replyTo`. It is also included in the body with the other fields.
@@ -61,14 +61,18 @@ The email has both a plain-text and an HTML body listing those fields, plus the 
 `forms.settings_json` may contain `subject`. It can include `{{field_name}}` and `{{form_id}}`. Missing fields become empty. The default is `New form submission ({{form_id}})`.
 
 ```json
-{"subject":"Contact from {{name}}"}
+{"subject":"Contact from {{name}}","honeypot_field":"company"}
 ```
+
+Omit `honeypot_field` to keep the default `math-sum`.
 
 Add further per-form options as new keys in `settings_json` and read them in `parseSettings` (`src/fields.ts`). Use a migration only when a setting needs to be filtered in SQL.
 
 ## Schema
 
-Source of truth: `migrations/0001_init.sql`. Timestamps are UTC ISO-8601 strings.
+Timestamps are UTC ISO-8601 strings.
+
+`migrations/0001_init.sql` created the original tables. `migrations/0002_drop_sending_claim.sql` removes the `sending` status and `claimed_at`. Apply `0002` before deploying this version. The schema after both migrations:
 
 ```sql
 CREATE TABLE forms (
@@ -83,12 +87,11 @@ CREATE TABLE submissions (
   form_id TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   submitter_email TEXT,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'spam')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'spam')),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   last_error TEXT,
   next_attempt_at TEXT,
   sent_at TEXT,
-  claimed_at TEXT,
   message_id TEXT,
   created_at TEXT NOT NULL,
   FOREIGN KEY (form_id) REFERENCES forms (id)
@@ -97,14 +100,13 @@ CREATE TABLE submissions (
 
 | Column | Role |
 | --- | --- |
-| `status` | `pending` (due when `next_attempt_at` is null or in the past), `sending` (claimed), `sent`, `failed` (gave up, row kept), `spam` (honeypot, never sent) |
-| `attempt_count` | Incremented when a row is claimed, before the send |
+| `status` | `pending` (waiting on the queue), `sent`, `failed` (dead-lettered, row kept), `spam` (honeypot, never sent) |
+| `attempt_count` | Incremented when a delivery attempt finishes, success or failure |
 | `last_error` | Last send error, including the Email Service `code` when the binding provides one. Cleared on success |
-| `next_attempt_at` | When a `pending` row becomes eligible. Null for `sent`, `failed`, and `spam` |
+| `next_attempt_at` | Set when the queue accepts the message, then moved to the next retry time after a failure. Null on a pending row means the enqueue never succeeded |
 | `sent_at` | When the send was accepted |
-| `claimed_at` | When the row moved to `sending`. A cron reclaims a claim older than `CLAIM_LEASE_SECONDS` so a crashed isolate does not strand the row |
 | `message_id` | Email Service id, so a sent row can be matched to Email Service logs |
-| `settings_json` | Per-form options. `subject` is the one this Worker reads today |
+| `settings_json` | Per-form options. This Worker reads `subject` and `honeypot_field` |
 
 D1 does not enforce the foreign key unless you turn foreign keys on. Do not `DELETE` from `submissions`. To count outcomes:
 
@@ -119,33 +121,29 @@ Rows still waiting or stuck:
 ```sql
 SELECT id, status, attempt_count, last_error, next_attempt_at, created_at
 FROM submissions
-WHERE status IN ('pending', 'sending', 'failed')
+WHERE status IN ('pending', 'failed')
 ORDER BY created_at DESC;
 ```
 
 ## Delivery and retries
 
-1. Insert as `pending` with `next_attempt_at` set to now.
-2. Claim it with a conditional update (`pending` → `sending`, `attempt_count + 1`). The inline send and the cron use the same claim, so only one of them sends.
-3. Call `env.EMAIL.send` with text, HTML, and `replyTo` when a submitter email is present.
-4. On success: `sent`, `sent_at`, `message_id`.
-5. On failure, if `attempt_count` is still below `MAX_ATTEMPTS`: back to `pending`, `last_error`, `next_attempt_at = now + delay`.
-6. On failure at `MAX_ATTEMPTS`: `failed`. The row stays.
+D1 is the permanent record. Cloudflare Queues does the sending.
 
-Delay is `RETRY_BASE_SECONDS * 2^(attempt-1)`, capped at `RETRY_MAX_SECONDS`. With the defaults, failures wait 60s, 120s, 240s, then 480s, and the fifth failure is final.
+1. Insert the row as `pending` with `next_attempt_at` null. Respond after that insert succeeds.
+2. `env.DELIVERY_QUEUE.send({ submissionId })` to `need-forms-delivery`. On success, set `next_attempt_at` so the hourly cron will not enqueue it again. If the enqueue throws, the HTTP response is still success and `next_attempt_at` stays null.
+3. The queue consumer skips a row that is already `sent`, `spam`, or `failed`, then acks.
+4. Otherwise it sends the email. On success it sets `sent`, `sent_at`, `message_id`, increments `attempt_count`, and acks.
+5. On send error it stores `last_error`, increments `attempt_count`, and calls `msg.retry({ delaySeconds })`. Delay is `RETRY_BASE_SECONDS * 2^(attempt-1)`, capped at `RETRY_MAX_SECONDS` (60s, then 120s, 240s, 480s, then one hour).
+6. After `max_retries` (5) the message lands on `need-forms-delivery-dlq`. That consumer marks the row `failed`, keeps `last_error`, and acks.
 
-The cron is `*/5 * * * *`. A row is picked up only once it is due **and** a cron run happens, so the first retry lands on the next 5-minute tick after the 60-second backoff. Change `triggers.crons` if you want a tighter pickup. Each run sends at most 25 due rows.
-
-A claim older than 10 minutes (`CLAIM_LEASE_SECONDS`) is put back to `pending` and tried again. That covers an isolate dying after the claim and before the result is saved. The window can send twice if the send succeeded and the process died before the `sent` update. The inline-versus-cron race does not: a live claim is not eligible.
+The cron is `0 * * * *`. It only re-enqueues `pending` rows whose `next_attempt_at` is still null and whose `created_at` is more than 15 minutes ago. That covers an enqueue that failed. It does not send mail itself. Each run publishes at most 25 rows.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `EMAIL_FROM` | `no-reply@forms.neednot.net` | From address. The domain must be onboarded to Email Sending |
 | `EMAIL_FROM_NAME` | `Need Forms` | From display name |
-| `MAX_ATTEMPTS` | `5` | Sends attempted before `failed` |
 | `RETRY_BASE_SECONDS` | `60` | First backoff |
 | `RETRY_MAX_SECONDS` | `3600` | Backoff cap |
-| `CLAIM_LEASE_SECONDS` | `600` | How long a `sending` claim is held |
 | `MAX_PAYLOAD_BYTES` | `100000` | Max request body. Enough for a long message, small enough to reject bulk junk |
 
 `EMAIL_FROM` is `no-reply@forms.neednot.net`. Sends stay `pending` until that domain is onboarded to Email Sending.
@@ -198,13 +196,11 @@ Running `seed/example.sql` again updates the `contact` row's destination and set
 
 ## Example HTML form
 
-Hide `_honeypot` visually and leave it empty. Bots that fill every input are stored as spam and are not emailed.
+Leave `math-sum` empty. Hide it off-screen with CSS. Do not use `type="hidden"`. Bots that fill every input are stored as spam and are not emailed.
 
 ```html
 <form action="https://forms.neednot.net/submit/contact" method="POST">
-  <p style="position:absolute;left:-9999px" aria-hidden="true">
-    <label>Leave this empty <input type="text" name="_honeypot" tabindex="-1" autocomplete="off"></label>
-  </p>
+  <input type="text" name="math-sum" autocomplete="off" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px">
   <label>Name <input name="name" required></label>
   <label>Email <input name="email" type="email" required></label>
   <label>Message <textarea name="message" required></textarea></label>
@@ -252,6 +248,6 @@ npm test
 npm run typecheck
 ```
 
-Vitest runs inside the Workers runtime via `@cloudflare/vitest-plugin` (the current package that replaces `@cloudflare/vitest-pool-workers`). The suite covers a saved submission, a successful send marked `sent`, a failed send left `pending` with backoff, a cron retry that sends and marks `sent`, max attempts marked `failed` with the row kept, an unknown form **404**, and the honeypot. Most cases install a fake sender so failure is deterministic. One case calls the local `send_email` binding, which does not deliver mail.
+Vitest runs inside the Workers runtime via `@cloudflare/vitest-plugin` (the current package that replaces `@cloudflare/vitest-pool-workers`). The suite covers a saved submission, a queue send that marks the row `sent`, a failed send left `pending` with backoff, the dead-letter path marking `failed`, the hourly re-enqueue, an unknown form **404**, and the honeypot. Most cases install a fake sender so failure is deterministic. One case calls the local `send_email` binding, which does not deliver mail.
 
 After changing bindings or vars, run `npm run types` and commit the regenerated `worker-configuration.d.ts`.

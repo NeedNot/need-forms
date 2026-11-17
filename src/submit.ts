@@ -1,8 +1,10 @@
 import { readConfig } from "./config";
-import { deliverSubmission } from "./deliver";
+import { publishDelivery } from "./deliver";
 import {
   findSubmitterEmail,
+  honeypotFieldName,
   isFormId,
+  parseSettings,
   partitionFields,
   serializeJsonValue,
 } from "./fields";
@@ -10,7 +12,7 @@ import { HttpError, htmlResponse, jsonResponse, mediaType, redirectResponse } fr
 
 const MAX_FIELDS = 100;
 
-type FormHit = { id: string };
+type FormHit = { id: string; settings_json: string };
 
 async function readCapped(request: Request, max: number): Promise<ArrayBuffer> {
   const declared = request.headers.get("content-length");
@@ -128,15 +130,10 @@ function thankYouPage(id: string): string {
 </html>`;
 }
 
-export async function handleSubmit(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-  formId: string,
-): Promise<Response> {
+export async function handleSubmit(request: Request, env: Env, formId: string): Promise<Response> {
   if (!isFormId(formId)) return jsonResponse({ ok: false, error: "form_not_found" }, 404);
 
-  const form = await env.DB.prepare(`SELECT id FROM forms WHERE id = ?1`)
+  const form = await env.DB.prepare(`SELECT id, settings_json FROM forms WHERE id = ?1`)
     .bind(formId)
     .first<FormHit>();
   if (!form) return jsonResponse({ ok: false, error: "form_not_found" }, 404);
@@ -145,7 +142,8 @@ export async function handleSubmit(
   const { fields: rawFields, htmlForm } = await readFields(request, config.maxPayloadBytes);
   if (Object.keys(rawFields).length > MAX_FIELDS) throw new HttpError(400, "too_many_fields");
 
-  const partitioned = partitionFields(rawFields);
+  const settings = parseSettings(form.settings_json);
+  const partitioned = partitionFields(rawFields, honeypotFieldName(settings));
   if (!partitioned.honeypotTripped && Object.keys(partitioned.fields).length === 0) {
     throw new HttpError(400, "empty_submission");
   }
@@ -158,27 +156,14 @@ export async function handleSubmit(
   await env.DB.prepare(
     `INSERT INTO submissions (
        id, form_id, payload_json, submitter_email, status, attempt_count,
-       last_error, next_attempt_at, sent_at, claimed_at, message_id, created_at
-     ) VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, NULL, NULL, NULL, ?7)`,
+       last_error, next_attempt_at, sent_at, message_id, created_at
+     ) VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL, NULL, NULL, ?6)`,
   )
-    .bind(
-      id,
-      form.id,
-      JSON.stringify(partitioned.fields),
-      submitter,
-      status,
-      status === "pending" ? createdAt : null,
-      createdAt,
-    )
+    .bind(id, form.id, JSON.stringify(partitioned.fields), submitter, status, createdAt)
     .run();
 
   if (status === "pending") {
-    ctx.waitUntil(
-      deliverSubmission(env, id).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(JSON.stringify({ message: "background delivery crashed", id, error: message }));
-      }),
-    );
+    await publishDelivery(env, id, new Date(createdAt));
   }
 
   console.log(JSON.stringify({ message: "submission stored", id, formId: form.id, status }));
